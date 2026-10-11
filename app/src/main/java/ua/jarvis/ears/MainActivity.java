@@ -59,8 +59,8 @@ public class MainActivity extends Activity {
         root.addView(token);
 
         mute = new CheckBox(this);
-        mute.setText("Вимкнути писк розпізнавання (але стихнуть і звуки сповіщень, поки слухає)");
-        mute.setChecked(sp.getBoolean("mute", false));
+        mute.setText("Під час розмови вимикати звуки сповіщень (щоб не пікало)");
+        mute.setChecked(sp.getBoolean("mute", true));
         root.addView(mute);
 
         Button start = new Button(this);
@@ -75,6 +75,17 @@ public class MainActivity extends Activity {
             ListenService.say("Зупинено.");
         });
         root.addView(stop);
+
+        Button dnd = new Button(this);
+        dnd.setText("Дозволити керувати «Не турбувати» (раджу)");
+        dnd.setOnClickListener(v -> {
+            try {
+                startActivity(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS));
+            } catch (Exception e) {
+                ListenService.say("Не вдалося відкрити налаштування: " + e.getMessage());
+            }
+        });
+        root.addView(dnd);
 
         Button batt = new Button(this);
         batt.setText("Не присипляти застосунок (раджу натиснути)");

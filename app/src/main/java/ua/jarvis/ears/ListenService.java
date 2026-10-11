@@ -22,7 +22,12 @@ import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 
 import org.json.JSONObject;
+import org.vosk.Model;
+import org.vosk.Recognizer;
+import org.vosk.android.SpeechService;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
@@ -32,6 +37,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 public class ListenService extends Service {
     public interface Sink { void show(String text); }
@@ -48,37 +55,66 @@ public class ListenService extends Service {
 
     public static synchronized String logText() { return LOG.toString(); }
 
-    private static final Pattern WAKE = Pattern.compile(
-            "(джарв[іиi]с|джарвис|жарвіс|жарвис|чарвіс|jarvis)", Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE);
+    private static final long IDLE_MS = 5 * 60 * 1000L;
+    private static final String MODEL_NAME = "vosk-model-small-en-us-0.15";
+    private static final String MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip";
+    private static final String GRAMMAR = "[\"jarvis\", \"jervis\", \"gervais\", \"[unk]\"]";
+    private static final Pattern WAKE_EN = Pattern.compile("jarvis|jervis|gervais");
+    private static final Pattern WAKE_UA = Pattern.compile(
+            "^\\s*(джарв[іиi]с|джарвис|жарвіс|жарвис|чарвіс|jarvis)[\\s,.!?:;\\-—]*", Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE);
+    private static final Pattern STOP_WORDS = Pattern.compile(
+            "^\\s*(відбій|відбой|досить слухати|вимкнись|до побачення|все дякую|стоп слухати)\\b.*",
+            Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE);
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private SpeechRecognizer sr;
     private TextToSpeech tts;
     private boolean ttsReady = false;
     private boolean want = false;
+    private boolean active = false;
+    private boolean waking = false;
     private boolean busy = false;
-    private long awaitUntil = 0;
     private PowerManager.WakeLock wl;
     private String base = "";
     private String token = "";
 
+    private Model model;
+    private SpeechService wakeSvc;
+    private Recognizer wakeRec;
+
+    private boolean silenced = false;
+    private boolean silencedByFilter = false;
+    private int prevFilter = NotificationManager.INTERRUPTION_FILTER_ALL;
+
+    private final Runnable idleTask = () -> endSession("5 хвилин тиші: перестаю слухати. Скажи «Джарвіс», щоб розбудити.");
+
     @Override
     public IBinder onBind(Intent intent) { return null; }
 
-    @Override
-    public int onStartCommand(Intent intent, int flags, int startId) {
-        String chan = "jarvis_ears";
-        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        nm.createNotificationChannel(new NotificationChannel(chan, "Джарвіс слухає", NotificationManager.IMPORTANCE_LOW));
+    private Notification notif(String text) {
         PendingIntent pi = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class),
                 PendingIntent.FLAG_IMMUTABLE);
-        Notification n = new Notification.Builder(this, chan)
-                .setContentTitle("Джарвіс слухає")
-                .setContentText("Скажи: «Джарвіс, ...»")
+        return new Notification.Builder(this, "jarvis_ears")
+                .setContentTitle("Джарвіс")
+                .setContentText(text)
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .setContentIntent(pi)
                 .setOngoing(true)
                 .build();
+    }
+
+    private void setNotif(String text) {
+        try {
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            nm.notify(1, notif(text));
+        } catch (Exception e) { }
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        nm.createNotificationChannel(new NotificationChannel("jarvis_ears", "Джарвіс", NotificationManager.IMPORTANCE_LOW));
+        Notification n = notif("Чекаю на слово «Джарвіс»");
         try {
             if (Build.VERSION.SDK_INT >= 29) {
                 startForeground(1, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
@@ -111,10 +147,12 @@ public class ListenService extends Service {
                 }
             });
         }
-        muteBeeps(true);
         want = true;
-        say("Слухаю. Скажи: «Джарвіс, ...»");
-        main.post(this::startListening);
+        if (model == null) {
+            prepareModel();
+        } else if (!active) {
+            main.post(this::startWake);
+        }
         return START_STICKY;
     }
 
@@ -122,27 +160,209 @@ public class ListenService extends Service {
     public void onDestroy() {
         want = false;
         main.removeCallbacksAndMessages(null);
+        stopWake();
         if (sr != null) { try { sr.destroy(); } catch (Exception e) { } sr = null; }
         if (tts != null) { try { tts.shutdown(); } catch (Exception e) { } tts = null; }
+        silenceOff();
+        if (model != null) { try { model.close(); } catch (Exception e) { } model = null; }
         if (wl != null && wl.isHeld()) wl.release();
-        muteBeeps(false);
         super.onDestroy();
     }
 
-    private void muteBeeps(boolean on) {
-        if (!getSharedPreferences("j", MODE_PRIVATE).getBoolean("mute", false)) return;
-        try {
-            AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-            int dir = on ? AudioManager.ADJUST_MUTE : AudioManager.ADJUST_UNMUTE;
-            am.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, dir, 0);
-            am.adjustStreamVolume(AudioManager.STREAM_SYSTEM, dir, 0);
-        } catch (Exception e) {
-            // без дозволу «Не турбувати» система не дає вимкнути звуки, це не страшно
+    // ---------- модель слова-будильника ----------
+    private void prepareModel() {
+        new Thread(() -> {
+            try {
+                File dir = new File(getFilesDir(), MODEL_NAME);
+                if (!new File(dir, "conf").exists()) {
+                    say("Завантажую голосову модель (40 МБ), це один раз. Потерпи...");
+                    File zip = new File(getFilesDir(), "model.zip");
+                    download(MODEL_URL, zip);
+                    File tmp = new File(getFilesDir(), "unz");
+                    deleteAll(tmp);
+                    unzip(zip, tmp);
+                    deleteAll(dir);
+                    if (!new File(tmp, MODEL_NAME).renameTo(dir)) throw new Exception("не вдалося розпакувати модель");
+                    deleteAll(tmp);
+                    zip.delete();
+                    say("Модель готова.");
+                }
+                Model m = new Model(dir.getAbsolutePath());
+                model = m;
+                main.post(this::startWake);
+            } catch (Throwable e) {
+                say("Не вдалося підготувати модель слова: " + e + ". Натисни «Запустити» ще раз.");
+            }
+        }).start();
+    }
+
+    private void deleteAll(File f) {
+        if (!f.exists()) return;
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) deleteAll(k);
+        f.delete();
+    }
+
+    private void download(String url, File out) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(15000);
+        c.setReadTimeout(30000);
+        if (c.getResponseCode() != 200) throw new Exception("сервер моделі відповів " + c.getResponseCode());
+        long total = c.getContentLengthLong();
+        long got = 0, nextLog = 10L * 1024 * 1024;
+        try (InputStream in = c.getInputStream(); OutputStream o = new FileOutputStream(out)) {
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                o.write(buf, 0, n);
+                got += n;
+                if (got >= nextLog) {
+                    say("  завантажено " + (got / 1048576) + " МБ" + (total > 0 ? " з " + (total / 1048576) : ""));
+                    nextLog += 10L * 1024 * 1024;
+                }
+            }
         }
     }
 
+    private void unzip(File zip, File dest) throws Exception {
+        dest.mkdirs();
+        String root = dest.getCanonicalPath() + File.separator;
+        try (ZipInputStream z = new ZipInputStream(new java.io.FileInputStream(zip))) {
+            ZipEntry e;
+            byte[] buf = new byte[65536];
+            while ((e = z.getNextEntry()) != null) {
+                File f = new File(dest, e.getName());
+                if (!f.getCanonicalPath().startsWith(root)) throw new Exception("поганий архів");
+                if (e.isDirectory()) { f.mkdirs(); continue; }
+                f.getParentFile().mkdirs();
+                try (OutputStream o = new FileOutputStream(f)) {
+                    int n;
+                    while ((n = z.read(buf)) > 0) o.write(buf, 0, n);
+                }
+            }
+        }
+    }
+
+    // ---------- режим «чекаю слово» (тихий, без писку) ----------
+    private final org.vosk.android.RecognitionListener wakeListener = new org.vosk.android.RecognitionListener() {
+        @Override public void onPartialResult(String h) { check(h); }
+        @Override public void onResult(String h) { check(h); }
+        @Override public void onFinalResult(String h) { check(h); }
+        @Override public void onError(Exception e) {
+            say("Помилка слуху: " + e.getMessage());
+            main.postDelayed(ListenService.this::startWake, 4000);
+        }
+        @Override public void onTimeout() { }
+
+        private void check(String h) {
+            if (active || waking || h == null) return;
+            if (WAKE_EN.matcher(h.toLowerCase()).find()) {
+                waking = true;
+                main.post(ListenService.this::beginSession);
+            }
+        }
+    };
+
+    private void startWake() {
+        if (!want || model == null || active) return;
+        stopWake();
+        try {
+            wakeRec = new Recognizer(model, 16000.0f, GRAMMAR);
+            wakeSvc = new SpeechService(wakeRec, 16000.0f);
+            wakeSvc.startListening(wakeListener);
+            setNotif("Чекаю на слово «Джарвіс»");
+            say("Чекаю на слово «Джарвіс».");
+        } catch (Throwable e) {
+            say("Не вдалося увімкнути слух: " + e + ". Пробую ще раз...");
+            main.postDelayed(this::startWake, 5000);
+        }
+    }
+
+    private void stopWake() {
+        SpeechService s = wakeSvc;
+        Recognizer r = wakeRec;
+        wakeSvc = null;
+        wakeRec = null;
+        if (s != null) {
+            try { s.stop(); } catch (Throwable e) { }
+            try { s.shutdown(); } catch (Throwable e) { }
+        }
+        if (r != null) { try { r.close(); } catch (Throwable e) { } }
+    }
+
+    // ---------- сесія розмови ----------
+    private void beginSession() {
+        if (!want) return;
+        stopWake();
+        active = true;
+        waking = false;
+        busy = false;
+        silenceOn();
+        beep();
+        setNotif("Слухаю тебе (вимкнусь після 5 хв тиші)");
+        say("Слухаю тебе. Скажи команду. «Відбій», щоб завершити.");
+        resetIdle();
+        main.postDelayed(this::startListening, 400);
+    }
+
+    private void endSession(String why) {
+        main.removeCallbacks(idleTask);
+        active = false;
+        waking = false;
+        busy = false;
+        if (sr != null) { try { sr.destroy(); } catch (Exception e) { } sr = null; }
+        if (tts != null) { try { tts.stop(); } catch (Exception e) { } }
+        silenceOff();
+        say(why);
+        main.postDelayed(this::startWake, 700);
+    }
+
+    private void resetIdle() {
+        main.removeCallbacks(idleTask);
+        main.postDelayed(idleTask, IDLE_MS);
+    }
+
+    private void silenceOn() {
+        if (silenced) return;
+        if (!getSharedPreferences("j", MODE_PRIVATE).getBoolean("mute", true)) return;
+        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        try {
+            if (nm.isNotificationPolicyAccessGranted()) {
+                prevFilter = nm.getCurrentInterruptionFilter();
+                nm.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_ALARMS);
+                silencedByFilter = true;
+                silenced = true;
+                return;
+            }
+        } catch (Exception e) { }
+        try {
+            AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            am.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, AudioManager.ADJUST_MUTE, 0);
+            am.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_MUTE, 0);
+            silenced = true;
+            silencedByFilter = false;
+        } catch (Exception e) {
+            say("(не вдалося вимкнути звуки сповіщень, дозволь «Не турбувати» у застосунку)");
+        }
+    }
+
+    private void silenceOff() {
+        if (!silenced) return;
+        silenced = false;
+        try {
+            if (silencedByFilter) {
+                NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                nm.setInterruptionFilter(prevFilter);
+            } else {
+                AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                am.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, AudioManager.ADJUST_UNMUTE, 0);
+                am.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_UNMUTE, 0);
+            }
+        } catch (Exception e) { }
+    }
+
     private void startListening() {
-        if (!want || busy) return;
+        if (!want || !active || busy) return;
         try {
             if (sr == null) {
                 sr = SpeechRecognizer.createSpeechRecognizer(this);
@@ -176,7 +396,7 @@ public class ListenService extends Service {
 
         @Override
         public void onError(int error) {
-            if (!want || busy) return;
+            if (!want || !active || busy) return;
             if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
                 say("Немає дозволу на мікрофон. Дозволь його в налаштуваннях застосунку.");
                 stopSelf();
@@ -197,7 +417,7 @@ public class ListenService extends Service {
         public void onResults(Bundle results) {
             ArrayList<String> list = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
             if (list != null && !list.isEmpty()) handleHeard(list.get(0));
-            if (!busy) main.postDelayed(ListenService.this::startListening, 200);
+            if (active && !busy) main.postDelayed(ListenService.this::startListening, 200);
         }
     };
 
@@ -211,26 +431,15 @@ public class ListenService extends Service {
 
     private void handleHeard(String text) {
         text = text.trim();
-        if (text.isEmpty()) return;
-        long now = System.currentTimeMillis();
-        if (now < awaitUntil) {
-            awaitUntil = 0;
-            ask(text);
+        if (text.isEmpty() || !active) return;
+        resetIdle();
+        text = WAKE_UA.matcher(text).replaceFirst("").trim();
+        if (text.isEmpty()) { beep(); return; }
+        if (STOP_WORDS.matcher(text).matches()) {
+            endSession("Добре, відбій. Скажи «Джарвіс», щоб розбудити.");
             return;
         }
-        Matcher m = WAKE.matcher(text);
-        if (m.find()) {
-            String rest = text.substring(m.end()).replaceFirst("^[\\s,.!?:;\\-—]+", "").trim();
-            if (!rest.isEmpty()) {
-                ask(rest);
-            } else {
-                beep();
-                awaitUntil = now + 8000;
-                say("Слухаю команду...");
-            }
-        } else {
-            say("(почула, але не до мене: " + text + ")");
-        }
+        ask(text);
     }
 
     private void ask(final String text) {
@@ -286,7 +495,10 @@ public class ListenService extends Service {
 
     private void finishTurn() {
         busy = false;
-        main.postDelayed(this::startListening, 300);
+        if (active) {
+            resetIdle();
+            main.postDelayed(this::startListening, 300);
+        }
     }
 
     private void speak(String reply) {
